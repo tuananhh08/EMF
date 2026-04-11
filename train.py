@@ -1,9 +1,13 @@
+#train/valid/test tren cung 1 tap data
 import argparse
 import os
 import time
 import pickle
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")           
+import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 
 from model import build_model, fit, predict
@@ -15,88 +19,115 @@ from loss  import HuberPoseLoss
 # ============================================================
 
 def get_args():
-    p = argparse.ArgumentParser(description="Train Decision Tree 6-DoF Localization")
-    p.add_argument("--emf",        type=str, default="emf_data.csv",
-                   help="Path to EMF data CSV (9 cols, no header)")
-    p.add_argument("--label",      type=str, default="roi_grid.csv",
-                   help="Path to pose label CSV (6 cols, with header)")
-    p.add_argument("--ckpt_dir",   type=str, default="checkpoints",
-                   help="Thư mục lưu model checkpoint")
+    p = argparse.ArgumentParser(description="Decision Tree 6-DoF Localization")
+    p.add_argument("--emf",        type=str,   default="emf_data.csv")
+    p.add_argument("--label",      type=str,   default="roi_grid.csv")
+    p.add_argument("--ckpt_dir",   type=str,   default="checkpoints")
     p.add_argument("--max_depth",  type=int,   default=30)
     p.add_argument("--val_ratio",  type=float, default=0.15)
     p.add_argument("--test_ratio", type=float, default=0.15)
-    p.add_argument("--ang_weight", type=float, default=1.0,
-                   help="Trọng số loss_ang trong HuberPoseLoss")
-    p.add_argument("--delta_xyz",  type=float, default=0.055,
-                   help="Ngưỡng Huber cho xyz")
-    p.add_argument("--delta_ang",  type=float, default=0.16,
-                   help="Ngưỡng Huber cho cos angles")
+    p.add_argument("--ang_weight", type=float, default=1.0)
+    p.add_argument("--delta_xyz",  type=float, default=0.055)
+    p.add_argument("--delta_ang",  type=float, default=0.16)
     p.add_argument("--seed",       type=int,   default=42)
     return p.parse_args()
 
 
 # ============================================================
-# DATA LOADING
+# DATA
 # ============================================================
 
-def load_data(emf_path: str, label_path: str, chunk: int = 200_000):
-    print(f"\n[Data] Đọc EMF  : {emf_path}")
-    X = np.vstack([
-        c.values.astype(np.float32)
-        for c in pd.read_csv(emf_path, header=None, chunksize=chunk)
-    ])
-
-    print(f"[Data] Đọc Label: {label_path}")
-    y = np.vstack([
-        c.values.astype(np.float32)
-        for c in pd.read_csv(label_path, chunksize=chunk)
-    ])
-
-    assert X.shape[0] == y.shape[0], \
-        f"Số dòng không khớp: X={X.shape[0]}, y={y.shape[0]}"
-    assert X.shape[1] == 9, f"EMF phải có 9 cột, hiện có {X.shape[1]}"
-    assert y.shape[1] == 6, f"Label phải có 6 cột, hiện có {y.shape[1]}"
-
+def load_data(emf_path, label_path, chunk=200_000):
+    print(f"\n[Data] EMF  : {emf_path}")
+    X = np.vstack([c.values.astype(np.float32)
+                   for c in pd.read_csv(emf_path, header=None, chunksize=chunk)])
+    print(f"[Data] Label: {label_path}")
+    y = np.vstack([c.values.astype(np.float32)
+                   for c in pd.read_csv(label_path, chunksize=chunk)])
+    assert X.shape[0] == y.shape[0]
+    assert X.shape[1] == 9 and y.shape[1] == 6
     print(f"[Data] X={X.shape}  y={y.shape}\n")
     return X, y
 
 
-# ============================================================
-# SPLIT
-# ============================================================
-
 def split_data(X, y, val_ratio, test_ratio, seed):
-    X_train, X_tmp, y_train, y_tmp = train_test_split(
-        X, y,
-        test_size=val_ratio + test_ratio,
-        random_state=seed,
-        shuffle=True
-    )
-    val_frac = val_ratio / (val_ratio + test_ratio)
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_tmp, y_tmp,
-        test_size=1 - val_frac,
-        random_state=seed
-    )
-    print(f"[Split] train={len(X_train):,}  val={len(X_val):,}  test={len(X_test):,}\n")
-    return X_train, X_val, X_test, y_train, y_val, y_test
+    X_tr, X_tmp, y_tr, y_tmp = train_test_split(
+        X, y, test_size=val_ratio+test_ratio, random_state=seed, shuffle=True)
+    vf = val_ratio / (val_ratio + test_ratio)
+    X_val, X_te, y_val, y_te = train_test_split(
+        X_tmp, y_tmp, test_size=1-vf, random_state=seed)
+    print(f"[Split] train={len(X_tr):,}  val={len(X_val):,}  test={len(X_te):,}\n")
+    return X_tr, X_val, X_te, y_tr, y_val, y_te
 
 
 # ============================================================
-# EVALUATE (in loss)
+# LEARNING CURVE  (loss vs max_depth)
 # ============================================================
 
-def evaluate(model, backend, X, y, criterion, split_name: str):
-    y_pred = predict(model, backend, X)
-    total, loss_xyz, loss_ang = criterion(
-        y_pred.astype(np.float64),
-        y.astype(np.float64)
-    )
-    print(f"[{split_name:5s}] "
-          f"Loss={total:.6f}  "
-          f"loss_xyz={loss_xyz:.6f}  "
-          f"loss_ang={loss_ang:.6f}")
-    return total
+def run_learning_curve(X_tr, y_tr, X_val, y_val,
+                       criterion, max_depth, seed, backend_hint=None):
+    """
+    Fit DT với từng depth 1 → max_depth, ghi train/val loss.
+
+    Returns
+    -------
+    depths       : list[int]
+    train_losses : list[float]
+    val_losses   : list[float]
+    """
+    depths, train_losses, val_losses = [], [], []
+
+    print(f"\n[Curve] Learning curve  depth 1 → {max_depth}")
+    print(f"{'Depth':>6}  {'Train Loss':>12}  {'Val Loss':>10}  {'Time':>7}")
+    print("-" * 42)
+
+    for d in range(1, max_depth + 1):
+        t0 = time.time()
+        m, backend = build_model(max_depth=d, random_state=seed)
+        m = fit(m, backend, X_tr, y_tr)
+
+        pred_tr  = predict(m, backend, X_tr).astype(np.float64)
+        pred_val = predict(m, backend, X_val).astype(np.float64)
+
+        tl, _, _ = criterion(pred_tr,  y_tr.astype(np.float64))
+        vl, _, _ = criterion(pred_val, y_val.astype(np.float64))
+
+        depths.append(d)
+        train_losses.append(tl)
+        val_losses.append(vl)
+
+        print(f"{d:>6}  {tl:>12.6f}  {vl:>10.6f}  {time.time()-t0:>6.1f}s")
+
+    return depths, train_losses, val_losses
+
+
+# ============================================================
+# PLOT
+# ============================================================
+
+def plot_loss_curve(depths, train_losses, val_losses,
+                    save_path: str, title: str = "Learning Curve"):
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    ax.plot(depths, train_losses, marker="o", markersize=4,
+            linewidth=1.8, label="Train Loss", color="#2563EB")
+    ax.plot(depths, val_losses,   marker="s", markersize=4,
+            linewidth=1.8, label="Val Loss",   color="#DC2626", linestyle="--")
+
+    best_d = depths[int(np.argmin(val_losses))]
+    best_v = min(val_losses)
+    ax.axvline(best_d, color="#16A34A", linestyle=":", linewidth=1.4,
+               label=f"Best depth={best_d}  val={best_v:.5f}")
+
+    ax.set_xlabel("max_depth", fontsize=12)
+    ax.set_ylabel("Huber Loss", fontsize=12)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.35)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"[Plot] Saved → {save_path}")
 
 
 # ============================================================
@@ -108,64 +139,77 @@ def main():
     np.random.seed(args.seed)
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
-    # --- Load ---
+    # Load & split
     X, y = load_data(args.emf, args.label)
+    X_tr, X_val, X_te, y_tr, y_val, y_te = split_data(
+        X, y, args.val_ratio, args.test_ratio, args.seed)
 
-    # --- Split ---
-    X_train, X_val, X_test, y_train, y_val, y_test = split_data(
-        X, y, args.val_ratio, args.test_ratio, args.seed
-    )
+    # Luu test split ra file de test.py load dung phan da tach
+    test_emf_path   = os.path.join(args.ckpt_dir, 'test_emf.csv')
+    test_label_path = os.path.join(args.ckpt_dir, 'test_label.csv')
+    pd.DataFrame(X_te).to_csv(test_emf_path, index=False, header=False)
+    pd.DataFrame(y_te, columns=['x_m','y_m','z_m','cos_roll','cos_pitch','cos_yaw']
+                 ).to_csv(test_label_path, index=False)
+    print(f'[Split] test_emf   -> {test_emf_path}')
+    print(f'[Split] test_label -> {test_label_path}')
 
-    # --- Loss ---
-    criterion = HuberPoseLoss(
-        ang_weight=args.ang_weight,
-        delta_xyz=args.delta_xyz,
-        delta_ang=args.delta_ang,
-    )
+    # Loss
+    criterion = HuberPoseLoss(ang_weight=args.ang_weight,
+                               delta_xyz=args.delta_xyz,
+                               delta_ang=args.delta_ang)
     print(f"[Loss] HuberPoseLoss  ang_weight={args.ang_weight}"
-          f"  delta_xyz={args.delta_xyz}  delta_ang={args.delta_ang}\n")
+          f"  delta_xyz={args.delta_xyz}  delta_ang={args.delta_ang}")
 
-    # --- Build model ---
-    model, backend = build_model(
-        max_depth=args.max_depth,
-        random_state=args.seed,
-    )
+    # Learning curve
+    depths, train_losses, val_losses = run_learning_curve(
+        X_tr, y_tr, X_val, y_val, criterion, args.max_depth, args.seed)
 
-    # --- Train ---
-    print(f"\n[Train] Bắt đầu training...")
+    # Plot
+    plot_path = os.path.join(args.ckpt_dir, "learning_curve.png")
+    plot_loss_curve(depths, train_losses, val_losses,
+                    save_path=plot_path,
+                    title="Decision Tree — Huber Loss vs max_depth")
+
+    # Fit final model ở best depth
+    best_depth = depths[int(np.argmin(val_losses))]
+    print(f"\n[Final] Fit model với best depth={best_depth}")
     t0 = time.time()
-    model = fit(model, backend, X_train, y_train)
-    train_time = time.time() - t0
-    print(f"[Train] Xong  ({train_time:.1f}s)\n")
+    model, backend = build_model(max_depth=best_depth, random_state=args.seed)
+    model = fit(model, backend, X_tr, y_tr)
+    print(f"[Final] Xong ({time.time()-t0:.1f}s)")
 
-    # --- Evaluate ---
-    evaluate(model, backend, X_train, y_train, criterion, "Train")
-    evaluate(model, backend, X_val,   y_val,   criterion, "Val")
-    evaluate(model, backend, X_test,  y_test,  criterion, "Test")
+    # Evaluate test
+    pred_te  = predict(model, backend, X_te).astype(np.float64)
+    tl_f, lx_f, la_f = criterion(
+        predict(model, backend, X_tr).astype(np.float64), y_tr.astype(np.float64))
+    vl_f, _, _        = criterion(
+        predict(model, backend, X_val).astype(np.float64), y_val.astype(np.float64))
+    te_l, te_x, te_a  = criterion(pred_te, y_te.astype(np.float64))
 
-    # --- Inference time ---
-    t_inf    = time.time()
-    _        = predict(model, backend, X_test)
-    inf_ms   = (time.time() - t_inf) / len(X_test) * 1000
-    print(f"\n[Infer] {inf_ms:.4f} ms/sample")
+    # Inference time
+    t_inf  = time.time()
+    _      = predict(model, backend, X_te)
+    inf_ms = (time.time() - t_inf) / len(X_te) * 1000
 
-    # --- Save checkpoint ---
-    ckpt_path = os.path.join(args.ckpt_dir, "dt_model.pkl")
-    with open(ckpt_path, "wb") as f:
-        pickle.dump({"model": model, "backend": backend, "args": vars(args)}, f)
-    sz = os.path.getsize(ckpt_path) / 1e6
-    print(f"\n[Save] Checkpoint → {ckpt_path}  ({sz:.1f} MB)")
+    # Save checkpoint
+    ckpt = os.path.join(args.ckpt_dir, "dt_model.pkl")
+    with open(ckpt, "wb") as f:
+        pickle.dump({"model": model, "backend": backend,
+                     "best_depth": best_depth, "args": vars(args)}, f)
 
-    # --- Summary ---
-    print(f"\n{'='*45}")
-    print(f"  Training Summary")
-    print(f"{'='*45}")
-    print(f"  Backend     : {backend}")
-    print(f"  max_depth   : {args.max_depth}")
-    print(f"  Train time  : {train_time:.1f}s")
-    print(f"  Infer time  : {inf_ms:.4f} ms/sample")
-    print(f"  Checkpoint  : {ckpt_path}")
-    print(f"{'='*45}\n")
+    # Summary
+    print(f"\n{'='*50}")
+    print(f"  Summary")
+    print(f"{'='*50}")
+    print(f"  Backend       : {backend}")
+    print(f"  Best depth    : {best_depth}")
+    print(f"  Train Loss    : {tl_f:.6f}  (xyz={lx_f:.6f}  ang={la_f:.6f})")
+    print(f"  Val   Loss    : {vl_f:.6f}")
+    print(f"  Test  Loss    : {te_l:.6f}  (xyz={te_x:.6f}  ang={te_a:.6f})")
+    print(f"  Infer time    : {inf_ms:.4f} ms/sample")
+    print(f"  Checkpoint    : {ckpt}")
+    print(f"  Plot          : {plot_path}")
+    print(f"{'='*50}\n")
 
 
 if __name__ == "__main__":
