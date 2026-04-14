@@ -22,6 +22,7 @@ class HuberPoseLoss:
                  target: np.ndarray):
         loss_xyz = self._huber(pred[:, :3] - target[:, :3], self.delta_xyz)
         loss_ang = self._huber(pred[:, 3:] - target[:, 3:], self.delta_ang)
-        total    = (1-self.ang_weight) * loss_xyz + self.ang_weight * loss_ang
+        # Multi-task weighting (always keep xyz term)
+        total = loss_xyz + self.ang_weight * loss_ang
         return total, loss_xyz, loss_ang
     

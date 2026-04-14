@@ -88,7 +88,15 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     diff_pos   = (y_true[:, :3] - y_pred[:, :3]) * 1000       
     pos_err    = np.linalg.norm(diff_pos, axis=1)             
 
+    # --- Orientation in cos-space (direct regression target) ---
+    diff_cos = y_true[:, 3:] - y_pred[:, 3:]
+    cos_mae = np.mean(np.abs(diff_cos), axis=0)  # (3,)
+    cos_rmse = np.sqrt(np.mean(diff_cos ** 2, axis=0))  # (3,)
+    cos_mae_mean = float(np.mean(cos_mae))
+    cos_rmse_mean = float(np.mean(cos_rmse))
+
     # --- Orientation: cos → angle (rad) → deg ---
+    # NOTE: This maps cos(theta) to theta in [0, 180] degrees.
     ang_true   = np.degrees(np.arccos(np.clip(y_true[:, 3:], -1, 1)))  # (N,3)
     ang_pred   = np.degrees(np.arccos(np.clip(y_pred[:, 3:], -1, 1)))  # (N,3)
     diff_ang   = ang_true - ang_pred                                     # (N,3)
@@ -101,6 +109,10 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
         "mean_ori_error_deg"   : float(ori_err.mean()),
         "rmse_pos_mm"          : float(np.sqrt(np.mean(pos_err ** 2))),
         "rmse_ori_deg"         : float(np.sqrt(np.mean(ori_err ** 2))),
+        "cos_mae_per_axis"      : cos_mae.astype(float),
+        "cos_rmse_per_axis"     : cos_rmse.astype(float),
+        "cos_mae_mean"          : cos_mae_mean,
+        "cos_rmse_mean"         : cos_rmse_mean,
     }
 
 
@@ -154,6 +166,8 @@ def make_figures(y_true: np.ndarray,
         f"Mean Orientation Error : {metrics['mean_ori_error_deg']:.4f}°\n"
         f"RMSE Position          : {metrics['rmse_pos_mm']:.4f} mm\n"
         f"RMSE Orientation       : {metrics['rmse_ori_deg']:.4f}°\n"
+        f"Cos-MAE (mean/axis)    : {metrics['cos_mae_mean']:.6f}\n"
+        f"Cos-RMSE (mean/axis)   : {metrics['cos_rmse_mean']:.6f}\n"
         f"N samples              : {N:,}"
     )
     ax1.text2D(
@@ -235,6 +249,10 @@ def main():
 
     # Load data
     X, y_true = load_data(args.emf, args.label)
+    preproc = ckpt_info.get("preproc", None)
+    if preproc is not None:
+        X = preproc.transform(X)
+        print("[Preprocess] Applied preprocessor from checkpoint\n")
 
     # Inference
     print("[Infer] Running inference...")
@@ -256,6 +274,8 @@ def main():
     print(f"  Mean Orientation Error: {metrics['mean_ori_error_deg']:.4f} deg")
     print(f"  RMSE Position         : {metrics['rmse_pos_mm']:.4f} mm")
     print(f"  RMSE Orientation      : {metrics['rmse_ori_deg']:.4f} deg")
+    print(f"  Cos MAE (mean)        : {metrics['cos_mae_mean']:.6f}")
+    print(f"  Cos RMSE (mean)       : {metrics['cos_rmse_mean']:.6f}")
     print(f"  Inference time        : {inf_ms:.4f} ms/sample")
     print(f"{'='*48}\n")
 
